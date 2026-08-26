@@ -23,6 +23,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::anthropic::models::requires_paid_subscription;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -687,20 +688,26 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 当前是否至少有一个可用凭据支持指定模型。
+    pub fn supports_model(&self, model: &str) -> bool {
+        let requires_paid = requires_paid_subscription(model);
+        self.entries.lock().iter().any(|entry| {
+            !entry.disabled
+                && (!requires_paid || entry.credentials.supports_premium_models())
+        })
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（高级模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+        let requires_paid = model.map(requires_paid_subscription).unwrap_or(false);
 
         // 过滤可用凭据
         let available: Vec<_> = entries
@@ -709,8 +716,8 @@ impl MultiTokenManager {
                 if e.disabled {
                     return false;
                 }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
+                // 高级模型需要检查订阅等级
+                if requires_paid && !e.credentials.supports_premium_models() {
                     return false;
                 }
                 true
@@ -751,7 +758,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（高级模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -778,7 +785,16 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && model
+                                    .map(|name| {
+                                        !requires_paid_subscription(name)
+                                            || e.credentials.supports_premium_models()
+                                    })
+                                    .unwrap_or(true)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 

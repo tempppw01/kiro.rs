@@ -25,6 +25,7 @@
 mod converter;
 mod handlers;
 mod middleware;
+pub(crate) mod models;
 mod router;
 mod stream;
 pub mod types;

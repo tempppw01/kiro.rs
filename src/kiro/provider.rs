@@ -46,6 +46,11 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    /// 判断当前凭据池是否能调用指定的 Kiro 模型。
+    pub fn supports_model(&self, model: &str) -> bool {
+        self.token_manager.supports_model(model)
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments

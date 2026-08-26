@@ -41,7 +41,7 @@
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **多模型支持**: 支持 Claude、GPT-5.6 及 DeepSeek、MiniMax、GLM、Qwen 等模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
@@ -437,15 +437,27 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
+| `auto` | `auto` |
+| `*gpt-5.6-sol*` | `gpt-5.6-sol` |
+| `*gpt-5.6-terra*` | `gpt-5.6-terra` |
+| `*gpt-5.6-luna*` | `gpt-5.6-luna` |
 | `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
+| `*sonnet*`（含 4.0/4-0） | `claude-sonnet-4.0` |
 | `*opus-5*` | `claude-opus-5` |
 | `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*haiku*` | `claude-haiku-4.5` |
+| `deepseek-3.2` | `deepseek-3.2` |
+| `minimax-m2.5` | `minimax-m2.5` |
+| `minimax-m2.1` | `minimax-m2.1` |
+| `glm-5` | `glm-5` |
+| `qwen3-coder-next` | `qwen3-coder-next` |
+
+`GET /v1/models` 会根据已识别的凭据订阅等级隐藏无法调用的高级模型；订阅等级尚未查询到时暂时保留完整列表。Free 账号可用的模型包括 Auto、Claude Sonnet 4.5、Claude Sonnet 4.0、DeepSeek 3.2、MiniMax M2.5、GLM-5、MiniMax M2.1 和 Qwen3 Coder Next。
 
 Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
 

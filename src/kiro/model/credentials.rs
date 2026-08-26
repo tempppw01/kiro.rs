@@ -250,15 +250,18 @@ impl KiroCredentials {
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
     pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
-        }
+        self.supports_premium_models()
+    }
+
+    /// 检查凭据是否支持需要付费订阅的模型。
+    ///
+    /// Kiro Free 不仅不能使用 Opus，还不能使用 Sonnet 4.6/5 等高级模型。
+    /// 订阅信息尚未查询到时暂时放行，避免把未知状态误判成 Free。
+    pub fn supports_premium_models(&self) -> bool {
+        self.subscription_title
+            .as_deref()
+            .map(|title| !title.to_uppercase().contains("FREE"))
+            .unwrap_or(true)
     }
 
     /// 检查是否为 API Key 凭据
@@ -373,6 +376,17 @@ mod tests {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 5);
+    }
+
+    #[test]
+    fn test_free_subscription_does_not_support_premium_models() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_title = Some("KIRO FREE".to_string());
+        assert!(!creds.supports_premium_models());
+        assert!(!creds.supports_opus());
+
+        creds.subscription_title = Some("KIRO PRO".to_string());
+        assert!(creds.supports_premium_models());
     }
 
     #[test]
