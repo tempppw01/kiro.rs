@@ -59,6 +59,26 @@ pub(crate) const MODEL_CATALOG: &[ModelSpec] = &[
         supports_thinking: false,
     },
     ModelSpec {
+        id: "claude-fable-5-1",
+        kiro_id: "claude-fable-5.1",
+        display_name: "Claude Fable 5.1",
+        created: 1_756_684_800,
+        max_tokens: 128_000,
+        context_window: 1_000_000,
+        access: ModelAccess::Premium,
+        supports_thinking: true,
+    },
+    ModelSpec {
+        id: "claude-opus-5-5",
+        kiro_id: "claude-opus-5.5",
+        display_name: "Claude Opus 5.5",
+        created: 1_790_035_200,
+        max_tokens: 128_000,
+        context_window: 1_000_000,
+        access: ModelAccess::Premium,
+        supports_thinking: true,
+    },
+    ModelSpec {
         id: "claude-opus-5",
         kiro_id: "claude-opus-5",
         display_name: "Claude Opus 5",
@@ -240,8 +260,16 @@ pub(crate) fn resolve_model(model: &str) -> Option<&'static ModelSpec> {
             || (spec.id == "deepseek-3.2" && base == "deepseek-3-2")
             || (spec.id == "minimax-m2.5" && base == "minimax-m2-5")
             || (spec.id == "minimax-m2.1" && base == "minimax-m2-1")
+            || (spec.id == "claude-fable-5-1" && base == "claude-fable-5")
+            || (spec.id == "claude-opus-5-5" && base == "claude-opus-5.5")
     }) {
         return (spec.supports_thinking || !is_thinking).then_some(spec);
+    }
+
+    // Kiro 侧 Fable ID 为点号形式 claude-fable-5.1（连字符形式会被上游拒绝），
+    // 目前仅上线 5.1 一个版本，故与 haiku 分支一致采用无条件映射。
+    if base.contains("fable") {
+        return MODEL_CATALOG.iter().find(|s| s.id == "claude-fable-5-1");
     }
 
     // Anthropic 客户端通常发送带日期的模型名；将旧版本归入 Kiro 中相应的兼容模型。
@@ -267,6 +295,10 @@ pub(crate) fn resolve_model(model: &str) -> Option<&'static ModelSpec> {
     }
 
     if base.contains("opus") {
+        // 5.5 必须先于 opus-5 判断：`contains("opus-5")` 会同时匹配 opus-5.5
+        if base.contains("opus-5-5") || base.contains("opus-5.5") {
+            return MODEL_CATALOG.iter().find(|s| s.id == "claude-opus-5-5");
+        }
         if base.contains("opus-5") {
             return MODEL_CATALOG.iter().find(|s| s.id == "claude-opus-5");
         }

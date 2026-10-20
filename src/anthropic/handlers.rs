@@ -550,7 +550,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let is_adaptive_thinking = (model_lower.contains("opus")
         && (model_lower.contains("4-6") || model_lower.contains("4.6")))
         || model_lower.contains("sonnet-5")
-        || model_lower.contains("opus-5");
+        || model_lower.contains("opus-5")
+        || model_lower.contains("fable");
 
     let thinking_type = if is_adaptive_thinking {
         "adaptive"
