@@ -196,6 +196,24 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 代理节点池 ============
+
+/// 代理节点池状态响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolStatusResponse {
+    /// 是否启用代理节点池
+    pub enabled: bool,
+    /// 选择策略（"roundRobin" 或 "random"）
+    pub strategy: String,
+    /// 节点总数
+    pub total: usize,
+    /// 当前可用节点数（未处于冷却）
+    pub available: usize,
+    /// 各节点状态列表
+    pub nodes: Vec<crate::http_client::ProxyNodeStatus>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

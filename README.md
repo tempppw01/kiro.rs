@@ -189,6 +189,7 @@ docker-compose up
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
+| `proxyPool` | object | - | HTTP 代理节点池配置，详见「代理配置」章节 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
@@ -215,6 +216,15 @@ docker-compose up
    "proxyUrl": "http://127.0.0.1:7890",
    "proxyUsername": "user",
    "proxyPassword": "pass",
+   "proxyPool": {
+      "nodes": [
+         { "url": "http://proxy-a.example.com:7890" },
+         { "url": "socks5://proxy-b.example.com:1080", "username": "user", "password": "pass" }
+      ],
+      "strategy": "roundRobin",
+      "maxFailures": 3,
+      "cooldownSecs": 60
+   },
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
    "extractThinking": true
@@ -243,7 +253,7 @@ docker-compose up
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
 | `machineId`    | string | 凭据级机器码（64位十六进制）                             |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
-| `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
+| `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理；未配置时走全局代理节点池） |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
 | `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）|
@@ -316,15 +326,57 @@ docker-compose up
 
 ### 代理配置
 
-支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
+支持全局代理、HTTP 代理节点池和凭据级代理。凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
 
-**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
+**代理优先级**：`凭据.proxyUrl` > `config.proxyPool` / `config.proxyUrl` > 无代理
 
 | 凭据 `proxyUrl` 值 | 行为 |
 |---|---|
-| 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理 |
-| `direct` | 显式不使用代理（即使全局配置了代理） |
-| 未配置（留空） | 回退到全局代理配置 |
+| 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理，绕过全局节点池，且不参与节点池健康统计 |
+| `direct` | 显式不使用代理（即使全局配置了代理或节点池） |
+| 未配置（留空） | 走全局代理节点池（无节点池时直连） |
+
+#### 全局代理节点池
+
+通过 `config.json` 的 `proxyPool` 配置多个代理节点，所有未单独指定代理的凭据会在节点间自动轮换。
+
+```json
+{
+   "proxyPool": {
+      "nodes": [
+         { "url": "http://proxy-a.example.com:7890" },
+         { "url": "http://proxy-b.example.com:7890", "username": "user", "password": "pass" },
+         { "url": "socks5://proxy-c.example.com:1080" }
+      ],
+      "strategy": "roundRobin",
+      "maxFailures": 3,
+      "cooldownSecs": 60
+   }
+}
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `nodes` | array | `[]` | 代理节点列表，每项含 `url`（必填）与可选的 `username` / `password` |
+| `strategy` | string | `roundRobin` | 节点选择策略：`roundRobin`（按顺序轮询）或 `random`（随机挑选可用节点） |
+| `maxFailures` | number | `3` | 单个节点连续失败多少次后被临时摘除 |
+| `cooldownSecs` | number | `60` | 节点被摘除后的冷却时长（秒），冷却结束后自动恢复 |
+
+**故障摘除与恢复**：
+
+- 只有**传输层错误**（连接失败、超时）和 **407 代理认证失败**计入节点失败；上游返回的 4xx/5xx 属于上游问题，不会摘除节点。
+- 节点连续失败达到 `maxFailures` 次后进入冷却，期间自动跳过该节点。
+- 冷却时间到达后节点自动回到可用状态，失败计数同时清零。
+- 若所有节点都在冷却中，会选择最早恢复的节点继续请求，**不会绕过代理直连**。
+- 每次重试都会重新挑选节点，因此被摘除的节点不会在后续重试中继续被选中。
+
+**兼容性**：
+
+- 只配置了 `config.proxyUrl` 时，等价于「只有一个节点的节点池」，行为与旧版完全一致。
+- `proxyPool` 与 `proxyUrl` 同时配置时，以 `proxyPool` 为准。
+- 节点池配置在服务启动时读取，修改后需要**重启服务**生效。
+
+**运行时状态查看**：Admin API 提供 `GET /api/admin/config/proxy-pool` 查询节点健康状态，`POST /api/admin/config/proxy-pool/reset` 清除失败计数与冷却状态。启用 Admin API 后，Web 管理界面的「代理节点池」面板同样可以查看并重置。
 
 凭据级代理示例：
 
@@ -476,6 +528,10 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/config/load-balancing` - 获取负载均衡模式
+  - `PUT /api/admin/config/load-balancing` - 设置负载均衡模式
+  - `GET /api/admin/config/proxy-pool` - 获取代理节点池状态
+  - `POST /api/admin/config/proxy-pool/reset` - 重置代理节点池健康状态
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

@@ -14,7 +14,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, ProxyPoolStatusResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -278,6 +279,29 @@ impl AdminService {
         LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
         }
+    }
+
+    /// 获取代理节点池状态
+    pub fn get_proxy_pool_status(&self) -> ProxyPoolStatusResponse {
+        let manager = self.token_manager.proxy_manager();
+        let nodes = manager.status();
+        let available = nodes.iter().filter(|n| !n.cooling).count();
+
+        ProxyPoolStatusResponse {
+            enabled: manager.has_global_proxy(),
+            strategy: manager
+                .pool()
+                .map(|p| p.strategy().as_str().to_string())
+                .unwrap_or_else(|| "roundRobin".to_string()),
+            total: nodes.len(),
+            available,
+            nodes,
+        }
+    }
+
+    /// 重置代理节点池健康状态（清除失败计数与冷却）
+    pub fn reset_proxy_pool(&self) {
+        self.token_manager.proxy_manager().reset();
     }
 
     /// 设置负载均衡模式

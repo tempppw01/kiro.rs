@@ -14,9 +14,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyManager, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -108,7 +109,7 @@ impl std::error::Error for RefreshTokenInvalidError {}
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
+    proxy_manager: &ProxyManager,
 ) -> anyhow::Result<KiroCredentials> {
     // API Key 凭据不支持 Token 刷新：底层契约级拦截
     // 其他调用点（try_ensure_token / 活跃路径 / add_credential）在调用前已显式分流 API Key；
@@ -133,9 +134,9 @@ pub(crate) async fn refresh_token(
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
-        refresh_idc_token(credentials, config, proxy).await
+        refresh_idc_token(credentials, config, proxy_manager).await
     } else {
-        refresh_social_token(credentials, config, proxy).await
+        refresh_social_token(credentials, config, proxy_manager).await
     }
 }
 
@@ -143,7 +144,7 @@ pub(crate) async fn refresh_token(
 async fn refresh_social_token(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
+    proxy_manager: &ProxyManager,
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 Social Token...");
 
@@ -156,12 +157,13 @@ async fn refresh_social_token(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let selection = proxy_manager.resolve(&credentials.proxy_override());
+    let client = build_client(selection.proxy(), 60, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
 
-    let response = client
+    let response = match client
         .post(&refresh_url)
         .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
@@ -174,7 +176,22 @@ async fn refresh_social_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // 传输层错误：代理节点链路不可用
+            selection.report_failure();
+            return Err(e.into());
+        }
+    };
+
+    if response.status().as_u16() == 407 {
+        // 407 由代理自身返回：节点认证信息失效
+        selection.report_failure();
+    } else {
+        selection.report_success();
+    }
 
     let status = response.status();
     if !status.is_success() {
@@ -226,7 +243,7 @@ async fn refresh_social_token(
 async fn refresh_idc_token(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
+    proxy_manager: &ProxyManager,
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 IdC Token...");
 
@@ -252,7 +269,8 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let selection = proxy_manager.resolve(&credentials.proxy_override());
+    let client = build_client(selection.proxy(), 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -260,7 +278,7 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
-    let response = client
+    let response = match client
         .post(&refresh_url)
         .header("content-type", "application/json")
         .header("x-amz-user-agent", x_amz_user_agent)
@@ -271,7 +289,22 @@ async fn refresh_idc_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // 传输层错误：代理节点链路不可用
+            selection.report_failure();
+            return Err(e.into());
+        }
+    };
+
+    if response.status().as_u16() == 407 {
+        // 407 由代理自身返回：节点认证信息失效
+        selection.report_failure();
+    } else {
+        selection.report_success();
+    }
 
     let status = response.status();
     if !status.is_success() {
@@ -325,7 +358,7 @@ pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
-    proxy: Option<&ProxyConfig>,
+    proxy_manager: &ProxyManager,
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
@@ -358,7 +391,8 @@ pub(crate) async fn get_usage_limits(
         kiro_version, machine_id
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let selection = proxy_manager.resolve(&credentials.proxy_override());
+    let client = build_client(selection.proxy(), 60, config.tls_backend)?;
 
     let mut request = client
         .get(&url)
@@ -374,7 +408,21 @@ pub(crate) async fn get_usage_limits(
         request = request.header("tokentype", "API_KEY");
     }
 
-    let response = request.send().await?;
+    let response = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            // 传输层错误：代理节点链路不可用
+            selection.report_failure();
+            return Err(e.into());
+        }
+    };
+
+    if response.status().as_u16() == 407 {
+        // 407 由代理自身返回：节点认证信息失效
+        selection.report_failure();
+    } else {
+        selection.report_success();
+    }
 
     let status = response.status();
     if !status.is_success() {
@@ -510,7 +558,8 @@ pub struct ManagerSnapshot {
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
     config: Config,
-    proxy: Option<ProxyConfig>,
+    /// 全局代理管理器（持有代理节点池与健康状态）
+    proxy_manager: Arc<ProxyManager>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -554,13 +603,13 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `config` - 应用配置
     /// * `credentials` - 凭据列表
-    /// * `proxy` - 可选的代理配置
+    /// * `proxy_manager` - 全局代理管理器（持有代理节点池）
     /// * `credentials_path` - 凭据文件路径（用于回写）
     /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
-        proxy: Option<ProxyConfig>,
+        proxy_manager: Arc<ProxyManager>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
@@ -647,7 +696,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
             config,
-            proxy,
+            proxy_manager,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
@@ -676,6 +725,11 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 获取全局代理管理器
+    pub fn proxy_manager(&self) -> &Arc<ProxyManager> {
+        &self.proxy_manager
     }
 
     /// 获取凭据总数
@@ -934,9 +988,8 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &self.config, &self.proxy_manager).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1579,10 +1632,8 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                        refresh_token(&current_creds, &self.config, &self.proxy_manager).await?;
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1617,8 +1668,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, &self.proxy_manager).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1730,8 +1781,7 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            refresh_token(&new_cred, &self.config, &self.proxy_manager).await?
         };
 
         // 4. 分配新 ID
@@ -1867,9 +1917,7 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = refresh_token(&credentials, &self.config, &self.proxy_manager).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2027,7 +2075,7 @@ mod tests {
         credentials.kiro_api_key = Some("ksk_test_key_123".to_string());
         credentials.auth_method = Some("api_key".to_string());
 
-        let result = refresh_token(&credentials, &config, None).await;
+        let result = refresh_token(&credentials, &config, &ProxyManager::default()).await;
 
         assert!(result.is_err(), "API Key 凭据应被 refresh_token 拒绝");
         let err_msg = result.unwrap_err().to_string();
@@ -2045,7 +2093,14 @@ mod tests {
         let mut existing = KiroCredentials::default();
         existing.refresh_token = Some("a".repeat(150));
 
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![existing],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut duplicate = KiroCredentials::default();
         duplicate.refresh_token = Some("a".repeat(150));
@@ -2058,7 +2113,14 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_api_key_success() {
         let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
@@ -2080,7 +2142,14 @@ mod tests {
         existing.kiro_api_key = Some("ksk_existing_key".to_string());
         existing.auth_method = Some("api_key".to_string());
 
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![existing],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut duplicate = KiroCredentials::default();
         duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
@@ -2098,7 +2167,14 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_api_key_empty_rejected() {
         let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut cred = KiroCredentials::default();
         cred.kiro_api_key = Some(String::new());
@@ -2116,7 +2192,14 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_api_key_missing_key_rejected() {
         let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut cred = KiroCredentials::default();
         cred.auth_method = Some("api_key".to_string());
@@ -2138,7 +2221,14 @@ mod tests {
         let mut oauth_cred = KiroCredentials::default();
         oauth_cred.refresh_token = Some("a".repeat(150));
 
-        let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![oauth_cred],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
@@ -2160,8 +2250,14 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.priority = 1;
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
     }
@@ -2169,7 +2265,13 @@ mod tests {
     #[test]
     fn test_multi_token_manager_empty_credentials() {
         let config = Config::default();
-        let result = MultiTokenManager::new(config, vec![], None, None, false);
+        let result = MultiTokenManager::new(
+            config,
+            vec![],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        );
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
         let manager = result.unwrap();
@@ -2185,7 +2287,13 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.id = Some(1); // 重复 ID
 
-        let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
+        let result = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        );
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(
@@ -2207,8 +2315,14 @@ mod tests {
         let mut good_cred = KiroCredentials::default();
         good_cred.refresh_token = Some("valid_token".to_string());
 
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![bad_cred, good_cred],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
     }
@@ -2222,7 +2336,14 @@ mod tests {
         cred.auth_method = Some("api_key".to_string());
         cred.kiro_api_key = Some("ksk_test123".to_string());
 
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
     }
@@ -2233,8 +2354,14 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         // 前两次失败不会禁用（使用 ID 1）
@@ -2258,7 +2385,14 @@ mod tests {
         let config = Config::default();
         let cred = KiroCredentials::default();
 
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         // 失败两次（使用 ID 1）
         manager.report_failure(1);
@@ -2281,8 +2415,14 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.refresh_token = Some("token2".to_string());
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let initial_id = manager.snapshot().current_id;
 
@@ -2303,7 +2443,7 @@ mod tests {
         let manager = MultiTokenManager::new(
             config,
             vec![KiroCredentials::default()],
-            None,
+            Arc::new(ProxyManager::default()),
             None,
             false,
         )
@@ -2330,8 +2470,14 @@ mod tests {
         cred2.access_token = Some("t2".to_string());
         cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
@@ -2363,8 +2509,14 @@ mod tests {
         good_cred.access_token = Some("good-token".to_string());
         good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![bad_cred, good_cred],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
@@ -2377,8 +2529,14 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(manager.available_count(), 2);
         for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
@@ -2402,8 +2560,14 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
             manager.report_refresh_failure(1);
@@ -2425,8 +2589,14 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         assert_eq!(manager.available_count(), 2);
@@ -2444,8 +2614,14 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            Arc::new(ProxyManager::default()),
+            None,
+            false,
+        )
+        .unwrap();
 
         manager.report_quota_exhausted(1);
         manager.report_quota_exhausted(2);

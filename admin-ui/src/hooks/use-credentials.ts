@@ -10,6 +10,8 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getProxyPoolStatus,
+  resetProxyPool,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +117,26 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取代理节点池状态
+export function useProxyPoolStatus() {
+  return useQuery({
+    queryKey: ['proxyPool'],
+    queryFn: getProxyPoolStatus,
+    refetchInterval: 10000, // 每 10 秒刷新一次节点健康状态
+  })
+}
+
+// 重置代理节点池健康状态
+export function useResetProxyPool() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: resetProxyPool,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
     },
   })
 }

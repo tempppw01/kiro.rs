@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::http_client::ProxyConfig;
+use crate::http_client::{ProxyConfig, ProxyOverride};
 use crate::model::config::Config;
 
 /// Kiro OAuth 凭证
@@ -215,12 +215,16 @@ impl KiroCredentials {
             .unwrap_or(config.effective_api_region())
     }
 
-    /// 获取有效的代理配置
-    /// 优先级：凭据代理 > 全局代理 > 无代理
-    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
-    pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
+    /// 获取代理覆盖决策
+    ///
+    /// 本方法不直接产出最终代理，而是描述「凭据是否覆盖全局代理池」的意图，
+    /// 由 [`crate::http_client::ProxyManager`] 结合全局代理池统一决策：
+    /// - 未配置凭据级代理 → `Inherit`（走全局代理池）
+    /// - 配置为 "direct" → `Direct`（显式直连，绕过全局代理池）
+    /// - 配置了具体地址 → `Fixed`（固定使用该代理，不参与节点池健康统计）
+    pub fn proxy_override(&self) -> ProxyOverride {
         match self.proxy_url.as_deref() {
-            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
+            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => ProxyOverride::Direct,
             Some(url) => {
                 let mut proxy = ProxyConfig::new(url);
                 if let (Some(username), Some(password)) =
@@ -228,9 +232,9 @@ impl KiroCredentials {
                 {
                     proxy = proxy.with_auth(username, password);
                 }
-                Some(proxy)
+                ProxyOverride::Fixed(proxy)
             }
-            None => global_proxy.cloned(),
+            None => ProxyOverride::Inherit,
         }
     }
 
@@ -827,61 +831,35 @@ mod tests {
     // ============ 凭据级代理优先级测试 ============
 
     #[test]
-    fn test_effective_proxy_credential_overrides_global() {
-        let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("socks5://cred:1080".to_string());
-
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, Some(ProxyConfig::new("socks5://cred:1080")));
+    fn test_proxy_override_inherit_when_not_configured() {
+        let creds = KiroCredentials::default();
+        assert!(matches!(creds.proxy_override(), ProxyOverride::Inherit));
     }
 
     #[test]
-    fn test_effective_proxy_credential_with_auth() {
-        let global = ProxyConfig::new("http://global:8080");
+    fn test_proxy_override_direct() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("direct".to_string());
+        assert!(matches!(creds.proxy_override(), ProxyOverride::Direct));
+
+        creds.proxy_url = Some("DIRECT".to_string());
+        assert!(matches!(creds.proxy_override(), ProxyOverride::Direct));
+    }
+
+    #[test]
+    fn test_proxy_override_fixed_with_auth() {
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("http://proxy:3128".to_string());
         creds.proxy_username = Some("user".to_string());
         creds.proxy_password = Some("pass".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
-        let expected = ProxyConfig::new("http://proxy:3128").with_auth("user", "pass");
-        assert_eq!(result, Some(expected));
-    }
-
-    #[test]
-    fn test_effective_proxy_direct_bypasses_global() {
-        let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("direct".to_string());
-
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_effective_proxy_direct_case_insensitive() {
-        let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("DIRECT".to_string());
-
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_effective_proxy_fallback_to_global() {
-        let global = ProxyConfig::new("http://global:8080");
-        let creds = KiroCredentials::default();
-
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
-    }
-
-    #[test]
-    fn test_effective_proxy_none_when_no_proxy() {
-        let creds = KiroCredentials::default();
-        let result = creds.effective_proxy(None);
-        assert_eq!(result, None);
+        match creds.proxy_override() {
+            ProxyOverride::Fixed(config) => {
+                assert_eq!(config.url, "http://proxy:3128");
+                assert_eq!(config.username, Some("user".to_string()));
+                assert_eq!(config.password, Some("pass".to_string()));
+            }
+            other => panic!("期望 Fixed，实际 {:?}", other),
+        }
     }
 }

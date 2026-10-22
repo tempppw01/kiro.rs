@@ -12,6 +12,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ProxyPoolCard } from '@/components/proxy-pool-card'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -604,6 +605,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
             </CardContent>
           </Card>
+        </div>
+
+        {/* 代理节点池 */}
+        <div className="mb-6">
+          <ProxyPoolCard />
         </div>
 
         {/* 凭据列表 */}

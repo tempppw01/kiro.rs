@@ -83,17 +83,19 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 构建代理配置
-    let proxy_config = config.proxy_url.as_ref().map(|url| {
-        let mut proxy = http_client::ProxyConfig::new(url);
-        if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password) {
-            proxy = proxy.with_auth(username, password);
-        }
-        proxy
-    });
+    // 构建代理管理器（proxyPool 多节点 / proxyUrl 单节点 归一化为统一的节点池）
+    let proxy_pool = http_client::build_proxy_pool(&config);
+    let proxy_manager = Arc::new(http_client::ProxyManager::new(proxy_pool));
 
-    if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+    match proxy_manager.pool() {
+        Some(pool) => {
+            tracing::info!(
+                "已配置 HTTP 代理节点池: {} 个节点，策略: {}",
+                pool.len(),
+                pool.strategy().as_str()
+            );
+        }
+        None => tracing::info!("未配置 HTTP 代理，使用直连"),
     }
 
     // 构建端点注册表
@@ -132,7 +134,7 @@ async fn main() {
     let token_manager = MultiTokenManager::new(
         config.clone(),
         credentials_list,
-        proxy_config.clone(),
+        proxy_manager.clone(),
         Some(credentials_path.into()),
         is_multiple_format,
     )
@@ -143,7 +145,7 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
-        proxy_config.clone(),
+        proxy_manager.clone(),
         endpoints,
         config.default_endpoint.clone(),
     );
@@ -153,7 +155,7 @@ async fn main() {
         api_url: config.count_tokens_api_url.clone(),
         api_key: config.count_tokens_api_key.clone(),
         auth_type: config.count_tokens_auth_type.clone(),
-        proxy: proxy_config,
+        proxy_manager,
         tls_backend: config.tls_backend,
     });
 

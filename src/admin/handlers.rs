@@ -140,3 +140,17 @@ pub async fn set_load_balancing_mode(
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
+/// GET /api/admin/config/proxy-pool
+/// 获取代理节点池状态
+pub async fn get_proxy_pool_status(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_proxy_pool_status();
+    Json(response)
+}
+
+/// POST /api/admin/config/proxy-pool/reset
+/// 重置代理节点池健康状态（清除失败计数与冷却）
+pub async fn reset_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    state.service.reset_proxy_pool();
+    Json(SuccessResponse::new("代理节点池状态已重置")).into_response()
+}

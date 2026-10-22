@@ -10,9 +10,9 @@
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyManager, ProxyOverride, build_client};
 use crate::model::config::TlsBackend;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -23,8 +23,8 @@ pub struct CountTokensConfig {
     pub api_key: Option<String>,
     /// count_tokens API 认证类型（"x-api-key" 或 "bearer"）
     pub auth_type: String,
-    /// 代理配置
-    pub proxy: Option<ProxyConfig>,
+    /// 全局代理管理器（持有代理节点池）
+    pub proxy_manager: Arc<ProxyManager>,
 
     pub tls_backend: TlsBackend,
 }
@@ -146,7 +146,9 @@ async fn call_remote_count_tokens(
     messages: &Vec<Message>,
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    // count_tokens 走全局代理池：每次调用挑选一个可用节点
+    let selection = config.proxy_manager.resolve(&ProxyOverride::Inherit);
+    let client = build_client(selection.proxy(), 300, config.tls_backend)?;
 
     // 构建请求体
     let request = CountTokensRequest {
@@ -169,11 +171,26 @@ async fn call_remote_count_tokens(
     }
 
     // 发送请求
-    let response = req_builder
+    let response = match req_builder
         .header("Content-Type", "application/json")
         .json(&request)
         .send()
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // 传输层错误：代理节点链路不可用
+            selection.report_failure();
+            return Err(e.into());
+        }
+    };
+
+    if response.status().as_u16() == 407 {
+        // 407 由代理自身返回：节点认证信息失效
+        selection.report_failure();
+    } else {
+        selection.report_success();
+    }
 
     if !response.status().is_success() {
         return Err(format!("API 返回错误状态: {}", response.status()).into());

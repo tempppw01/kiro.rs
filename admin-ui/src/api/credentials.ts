@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  ProxyPoolStatusResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +103,17 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取代理节点池状态
+export async function getProxyPoolStatus(): Promise<ProxyPoolStatusResponse> {
+  const { data } = await api.get<ProxyPoolStatusResponse>('/config/proxy-pool')
+  return data
+}
+
+// 重置代理节点池健康状态
+export async function resetProxyPool(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/config/proxy-pool/reset')
   return data
 }

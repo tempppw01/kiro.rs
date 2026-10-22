@@ -40,6 +40,25 @@ export interface BalanceResponse {
   nextResetAt: number | null
 }
 
+// 单个代理节点状态
+export interface ProxyNodeStatus {
+  index: number
+  url: string
+  hasAuth: boolean
+  failures: number
+  cooling: boolean
+  cooldownRemainingSecs: number | null
+}
+
+// 代理节点池状态响应
+export interface ProxyPoolStatusResponse {
+  enabled: boolean
+  strategy: string
+  total: number
+  available: number
+  nodes: ProxyNodeStatus[]
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean

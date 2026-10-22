@@ -83,6 +83,15 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
+    /// HTTP 代理节点池配置（可选）
+    ///
+    /// 配置后所有未单独指定代理的凭据都会走代理池，按策略在节点间轮换。
+    /// 节点连续失败达到阈值会被临时摘除，冷却结束后自动恢复。
+    /// `proxyUrl` 与 `proxyPool` 同时配置时以 `proxyPool` 为准。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_pool: Option<ProxyPoolConfig>,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -159,6 +168,57 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_proxy_pool_strategy() -> String {
+    "roundRobin".to_string()
+}
+
+fn default_proxy_pool_max_failures() -> u32 {
+    crate::http_client::DEFAULT_PROXY_POOL_MAX_FAILURES
+}
+
+fn default_proxy_pool_cooldown_secs() -> u64 {
+    crate::http_client::DEFAULT_PROXY_POOL_COOLDOWN_SECS
+}
+
+/// 代理节点池配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolConfig {
+    /// 代理节点列表
+    #[serde(default)]
+    pub nodes: Vec<ProxyNodeConfig>,
+
+    /// 选择策略："roundRobin"（默认）或 "random"
+    #[serde(default = "default_proxy_pool_strategy")]
+    pub strategy: String,
+
+    /// 节点连续失败多少次后被临时摘除（默认 3）
+    #[serde(default = "default_proxy_pool_max_failures")]
+    pub max_failures: u32,
+
+    /// 节点被摘除后的冷却时长（秒，默认 60）
+    #[serde(default = "default_proxy_pool_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+/// 代理节点配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyNodeConfig {
+    /// 代理地址，支持 http/https/socks5
+    pub url: String,
+
+    /// 代理认证用户名（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+
+    /// 代理认证密码（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -179,6 +239,7 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_pool: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, ProxyManager, ProxySelection, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -32,8 +32,8 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
+    /// 全局代理管理器（持有代理节点池与健康状态）
+    proxy_manager: Arc<ProxyManager>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -55,12 +55,12 @@ impl KiroProvider {
     ///
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
-    /// * `proxy` - 全局代理配置
+    /// * `proxy_manager` - 全局代理管理器（持有代理节点池）
     /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
     /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
-        proxy: Option<ProxyConfig>,
+        proxy_manager: Arc<ProxyManager>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
     ) -> Self {
@@ -70,15 +70,14 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        // 预热：构建直连 Client（无代理时使用）
+        let initial_client = build_client(None, 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
+        cache.insert(None, initial_client);
 
         Self {
             token_manager,
-            global_proxy: proxy,
+            proxy_manager,
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
@@ -86,16 +85,23 @@ impl KiroProvider {
         }
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+    /// 根据凭据的代理决策获取（或创建并缓存）对应的 reqwest::Client
+    ///
+    /// 返回值包含本次请求实际使用的代理选择结果（直连 / 固定代理 / 池节点），
+    /// 调用方需在请求结束后把结果反馈给代理池（`report_success` / `report_failure`）。
+    fn client_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<(Client, ProxySelection)> {
+        let selection = self.proxy_manager.resolve(&credentials.proxy_override());
+        let effective = selection.proxy().cloned();
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
-            return Ok(client.clone());
+            return Ok((client.clone(), selection));
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
-        Ok(client)
+        Ok((client, selection))
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -170,8 +176,9 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // 每轮重试都重新选择代理节点：失败节点会在下一轮被池自动跳过
+            let (client, selection) = self.client_for(&ctx.credentials)?;
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -181,6 +188,8 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    // 传输层错误：代理节点链路不可用，计入节点失败
+                    selection.report_failure();
                     tracing::warn!(
                         "MCP 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
@@ -196,6 +205,13 @@ impl KiroProvider {
             };
 
             let status = response.status();
+
+            // 407 由代理自身返回：说明该节点的认证信息失效，计入节点失败
+            if status.as_u16() == 407 {
+                selection.report_failure();
+            } else {
+                selection.report_success();
+            }
 
             // 成功响应
             if status.is_success() {
@@ -327,8 +343,9 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // 每轮重试都重新选择代理节点：失败节点会在下一轮被池自动跳过
+            let (client, selection) = self.client_for(&ctx.credentials)?;
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -338,6 +355,8 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    // 传输层错误：代理节点链路不可用，计入节点失败
+                    selection.report_failure();
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
@@ -355,6 +374,13 @@ impl KiroProvider {
             };
 
             let status = response.status();
+
+            // 407 由代理自身返回：说明该节点的认证信息失效，计入节点失败
+            if status.as_u16() == 407 {
+                selection.report_failure();
+            } else {
+                selection.report_success();
+            }
 
             // 成功响应
             if status.is_success() {
