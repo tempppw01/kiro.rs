@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SetProxyPoolRequest, SuccessResponse,
     },
 };
 
@@ -146,6 +146,18 @@ pub async fn set_load_balancing_mode(
 pub async fn get_proxy_pool_status(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_proxy_pool_status();
     Json(response)
+}
+
+/// PUT /api/admin/config/proxy-pool
+/// 保存并启用/停用代理节点池
+pub async fn set_proxy_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProxyPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_pool(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/config/proxy-pool/reset

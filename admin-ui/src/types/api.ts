@@ -54,9 +54,20 @@ export interface ProxyNodeStatus {
 export interface ProxyPoolStatusResponse {
   enabled: boolean
   strategy: string
+  maxFailures: number
+  cooldownSecs: number
+  proxyUrls: string
   total: number
   available: number
   nodes: ProxyNodeStatus[]
+}
+
+export interface SetProxyPoolRequest {
+  enabled: boolean
+  proxyUrls: string
+  strategy: 'roundRobin' | 'random'
+  maxFailures: number
+  cooldownSecs: number
 }
 
 // 成功响应

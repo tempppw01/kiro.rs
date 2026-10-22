@@ -206,12 +206,50 @@ pub struct ProxyPoolStatusResponse {
     pub enabled: bool,
     /// 选择策略（"roundRobin" 或 "random"）
     pub strategy: String,
+    /// 节点连续失败多少次后临时摘除
+    pub max_failures: u32,
+    /// 节点摘除后的冷却时长（秒）
+    pub cooldown_secs: u64,
+    /// 代理地址列表（每行一个，不含认证信息）
+    pub proxy_urls: String,
     /// 节点总数
     pub total: usize,
     /// 当前可用节点数（未处于冷却）
     pub available: usize,
     /// 各节点状态列表
     pub nodes: Vec<crate::http_client::ProxyNodeStatus>,
+}
+
+/// 设置代理节点池请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyPoolRequest {
+    /// 是否启用代理节点池
+    pub enabled: bool,
+    /// 代理地址列表（每行一个）
+    #[serde(default)]
+    pub proxy_urls: String,
+    /// 选择策略（"roundRobin" 或 "random"）
+    #[serde(default = "default_proxy_pool_strategy")]
+    pub strategy: String,
+    /// 节点连续失败多少次后临时摘除
+    #[serde(default = "default_proxy_pool_max_failures")]
+    pub max_failures: u32,
+    /// 节点摘除后的冷却时长（秒）
+    #[serde(default = "default_proxy_pool_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+fn default_proxy_pool_strategy() -> String {
+    "roundRobin".to_string()
+}
+
+fn default_proxy_pool_max_failures() -> u32 {
+    crate::http_client::DEFAULT_PROXY_POOL_MAX_FAILURES
+}
+
+fn default_proxy_pool_cooldown_secs() -> u64 {
+    crate::http_client::DEFAULT_PROXY_POOL_COOLDOWN_SECS
 }
 
 // ============ 通用响应 ============

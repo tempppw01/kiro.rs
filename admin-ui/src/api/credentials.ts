@@ -9,6 +9,7 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   ProxyPoolStatusResponse,
+  SetProxyPoolRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -109,6 +110,14 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
 // 获取代理节点池状态
 export async function getProxyPoolStatus(): Promise<ProxyPoolStatusResponse> {
   const { data } = await api.get<ProxyPoolStatusResponse>('/config/proxy-pool')
+  return data
+}
+
+// 保存并启用/停用代理节点池
+export async function setProxyPool(
+  req: SetProxyPoolRequest
+): Promise<ProxyPoolStatusResponse> {
+  const { data } = await api.put<ProxyPoolStatusResponse>('/config/proxy-pool', req)
   return data
 }
 

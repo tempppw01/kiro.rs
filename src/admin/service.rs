@@ -8,18 +8,23 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::http_client::{ProxyPoolStrategy, proxy_url_without_auth};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::{Config, ProxyNodeConfig, ProxyPoolConfig};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, ProxyPoolStatusResponse,
-    SetLoadBalancingModeRequest,
+    SetLoadBalancingModeRequest, SetProxyPoolRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 单次最多允许配置的代理节点数
+const MAX_PROXY_POOL_NODES: usize = 1000;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,19 +289,66 @@ impl AdminService {
     /// 获取代理节点池状态
     pub fn get_proxy_pool_status(&self) -> ProxyPoolStatusResponse {
         let manager = self.token_manager.proxy_manager();
+        let pool = manager.pool();
         let nodes = manager.status();
         let available = nodes.iter().filter(|n| !n.cooling).count();
+        let proxy_urls = nodes
+            .iter()
+            .map(|node| node.url.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         ProxyPoolStatusResponse {
             enabled: manager.has_global_proxy(),
-            strategy: manager
-                .pool()
+            strategy: pool
+                .as_ref()
                 .map(|p| p.strategy().as_str().to_string())
                 .unwrap_or_else(|| "roundRobin".to_string()),
+            max_failures: pool
+                .as_ref()
+                .map(|p| p.max_failures())
+                .unwrap_or(crate::http_client::DEFAULT_PROXY_POOL_MAX_FAILURES),
+            cooldown_secs: pool
+                .as_ref()
+                .map(|p| p.cooldown_secs())
+                .unwrap_or(crate::http_client::DEFAULT_PROXY_POOL_COOLDOWN_SECS),
+            proxy_urls,
             total: nodes.len(),
             available,
             nodes,
         }
+    }
+
+    /// 保存并热替换代理节点池
+    pub fn set_proxy_pool(
+        &self,
+        req: SetProxyPoolRequest,
+    ) -> Result<ProxyPoolStatusResponse, AdminServiceError> {
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .ok_or_else(|| {
+                AdminServiceError::InternalError(
+                    "配置文件路径未知，无法持久化代理节点池".to_string(),
+                )
+            })?
+            .to_path_buf();
+        let config = Config::load(&config_path).map_err(|e| {
+            AdminServiceError::InternalError(format!(
+                "重新加载配置失败: {}: {}",
+                config_path.display(),
+                e
+            ))
+        })?;
+        let existing_nodes = configured_proxy_nodes(&config);
+        let pool = build_proxy_pool_config(req, &existing_nodes)?;
+
+        self.token_manager
+            .set_proxy_pool(pool)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_proxy_pool_status())
     }
 
     /// 重置代理节点池健康状态（清除失败计数与冷却）
@@ -472,10 +524,244 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+/// 读取当前配置中的代理节点，用于保留未重新输入的认证信息
+fn configured_proxy_nodes(config: &Config) -> Vec<ProxyNodeConfig> {
+    let nodes = match config.proxy_pool.as_ref() {
+        Some(pool) if !pool.nodes.is_empty() => pool.nodes.clone(),
+        _ => match config.proxy_url.as_deref() {
+            Some(url) if !url.trim().is_empty() => vec![ProxyNodeConfig {
+                url: url.to_string(),
+                username: config.proxy_username.clone(),
+                password: config.proxy_password.clone(),
+            }],
+            _ => Vec::new(),
+        },
+    };
+
+    nodes
+        .into_iter()
+        .map(|mut node| {
+            if node.username.is_none() && node.password.is_none() {
+                if let Ok(parsed) = parse_proxy_url(&node.url) {
+                    node.url = parsed.url;
+                    node.username = parsed.username;
+                    node.password = parsed.password;
+                }
+            }
+            node.url = proxy_url_without_auth(&node.url);
+            node
+        })
+        .collect()
+}
+
+fn build_proxy_pool_config(
+    req: SetProxyPoolRequest,
+    existing_nodes: &[ProxyNodeConfig],
+) -> Result<Option<ProxyPoolConfig>, AdminServiceError> {
+    if !req.enabled {
+        return Ok(None);
+    }
+
+    let strategy = ProxyPoolStrategy::parse(&req.strategy).ok_or_else(|| {
+        AdminServiceError::InvalidConfig("strategy 必须是 roundRobin 或 random".to_string())
+    })?;
+    if !(1..=1000).contains(&req.max_failures) {
+        return Err(AdminServiceError::InvalidConfig(
+            "maxFailures 必须在 1 到 1000 之间".to_string(),
+        ));
+    }
+    if !(1..=604_800).contains(&req.cooldown_secs) {
+        return Err(AdminServiceError::InvalidConfig(
+            "cooldownSecs 必须在 1 到 604800 之间".to_string(),
+        ));
+    }
+
+    let mut nodes = parse_proxy_pool_lines(&req.proxy_urls)?;
+    preserve_proxy_auth(&mut nodes, existing_nodes);
+
+    Ok(Some(ProxyPoolConfig {
+        nodes,
+        strategy: strategy.as_str().to_string(),
+        max_failures: req.max_failures,
+        cooldown_secs: req.cooldown_secs,
+    }))
+}
+
+/// 解析管理页提交的代理文本：空行和 `#` 注释会被忽略。
+fn parse_proxy_pool_lines(input: &str) -> Result<Vec<ProxyNodeConfig>, AdminServiceError> {
+    let mut nodes = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if nodes.len() >= MAX_PROXY_POOL_NODES {
+            return Err(AdminServiceError::InvalidConfig(format!(
+                "代理节点不能超过 {} 个",
+                MAX_PROXY_POOL_NODES
+            )));
+        }
+        nodes.push(parse_proxy_url(line).map_err(|message| {
+            AdminServiceError::InvalidConfig(format!("第 {} 行: {}", index + 1, message))
+        })?);
+    }
+
+    if nodes.is_empty() {
+        return Err(AdminServiceError::InvalidConfig(
+            "启用代理节点池时至少需要填写一个代理地址".to_string(),
+        ));
+    }
+    Ok(nodes)
+}
+
+fn parse_proxy_url(raw: &str) -> Result<ProxyNodeConfig, String> {
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{}", raw)
+    };
+    let mut url = reqwest::Url::parse(&candidate).map_err(|_| "代理地址格式错误".to_string())?;
+
+    if !matches!(url.scheme(), "http" | "https" | "socks5") {
+        return Err(format!(
+            "不支持的代理协议 \"{}\"，仅支持 http、https、socks5",
+            url.scheme()
+        ));
+    }
+    if !url.has_host() {
+        return Err("代理地址缺少主机名".to_string());
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("代理地址不能包含路径、查询参数或片段".to_string());
+    }
+
+    let username = url.username().to_string();
+    let password = url.password().map(ToString::to_string);
+    if username.is_empty() != password.is_none() {
+        return Err("代理认证必须同时提供用户名和密码".to_string());
+    }
+
+    let username = if username.is_empty() {
+        None
+    } else {
+        Some(
+            urlencoding::decode(&username)
+                .map_err(|_| "代理用户名编码无效".to_string())?
+                .into_owned(),
+        )
+    };
+    let password = match password {
+        Some(password) => Some(
+            urlencoding::decode(&password)
+                .map_err(|_| "代理密码编码无效".to_string())?
+                .into_owned(),
+        ),
+        None => None,
+    };
+
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let mut normalized = url.to_string();
+    if url.path() == "/" {
+        normalized.pop();
+    }
+
+    Ok(ProxyNodeConfig {
+        url: normalized,
+        username,
+        password,
+    })
+}
+
+fn preserve_proxy_auth(nodes: &mut [ProxyNodeConfig], existing_nodes: &[ProxyNodeConfig]) {
+    let mut used = vec![false; existing_nodes.len()];
+    for node in nodes {
+        if node.username.is_some() || node.password.is_some() {
+            continue;
+        }
+        if let Some((index, existing)) =
+            existing_nodes.iter().enumerate().find(|(index, existing)| {
+                !used[*index]
+                    && existing.username.is_some()
+                    && existing.password.is_some()
+                    && existing.url == node.url
+            })
+        {
+            node.username = existing.username.clone();
+            node.password = existing.password.clone();
+            used[index] = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_proxy_pool_lines_skips_comments_and_adds_default_scheme() {
+        let nodes = parse_proxy_pool_lines(
+            "# 主节点\nproxy.example.com:8080\n\nuser:p%40ss@127.0.0.1:8081\nsocks5://user:p%40ss@127.0.0.1:1080\n",
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].url, "http://proxy.example.com:8080");
+        assert!(nodes[0].username.is_none());
+        assert_eq!(nodes[1].url, "http://127.0.0.1:8081");
+        assert_eq!(nodes[1].username.as_deref(), Some("user"));
+        assert_eq!(nodes[1].password.as_deref(), Some("p@ss"));
+        assert_eq!(nodes[2].url, "socks5://127.0.0.1:1080");
+        assert_eq!(nodes[2].username.as_deref(), Some("user"));
+        assert_eq!(nodes[2].password.as_deref(), Some("p@ss"));
+    }
+
+    #[test]
+    fn parse_proxy_pool_lines_reports_invalid_line_number() {
+        let error = parse_proxy_pool_lines("http://127.0.0.1:8080\nftp://127.0.0.1:21")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("第 2 行"));
+        assert!(error.contains("不支持的代理协议"));
+    }
+
+    #[test]
+    fn preserve_proxy_auth_reuses_credentials_for_unchanged_masked_url() {
+        let existing = vec![ProxyNodeConfig {
+            url: "http://proxy.example.com:8080".to_string(),
+            username: Some("user".to_string()),
+            password: Some("secret".to_string()),
+        }];
+        let mut nodes = parse_proxy_pool_lines("http://proxy.example.com:8080").unwrap();
+
+        preserve_proxy_auth(&mut nodes, &existing);
+
+        assert_eq!(nodes[0].username.as_deref(), Some("user"));
+        assert_eq!(nodes[0].password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn build_proxy_pool_config_allows_disable_without_nodes() {
+        let pool = build_proxy_pool_config(
+            SetProxyPoolRequest {
+                enabled: false,
+                proxy_urls: String::new(),
+                strategy: "roundRobin".to_string(),
+                max_failures: 3,
+                cooldown_secs: 60,
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(pool.is_none());
     }
 }

@@ -12,8 +12,9 @@ import {
   setLoadBalancingMode,
   getProxyPoolStatus,
   resetProxyPool,
+  setProxyPool,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, SetProxyPoolRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -135,6 +136,17 @@ export function useResetProxyPool() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: resetProxyPool,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
+    },
+  })
+}
+
+// 保存并启用/停用代理节点池
+export function useSetProxyPool() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetProxyPoolRequest) => setProxyPool(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
     },

@@ -6,7 +6,7 @@ use reqwest::{Client, Proxy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::model::config::{Config, TlsBackend};
 
@@ -176,6 +176,16 @@ impl ProxyPool {
         self.strategy
     }
 
+    /// 连续失败达到该次数后摘除节点
+    pub fn max_failures(&self) -> u32 {
+        self.max_failures
+    }
+
+    /// 节点摘除后的冷却时长（秒）
+    pub fn cooldown_secs(&self) -> u64 {
+        self.cooldown.as_secs()
+    }
+
     /// 挑选一个可用节点
     pub fn select(&self) -> Option<ProxyLease> {
         let count = self.nodes.len();
@@ -246,7 +256,7 @@ impl ProxyPool {
             tracing::warn!(
                 "代理节点 #{} ({}) 连续失败 {} 次，暂时摘除 {} 秒",
                 index,
-                lease.config.url,
+                proxy_url_without_auth(&lease.config.url),
                 state.failures[index],
                 self.cooldown.as_secs()
             );
@@ -287,8 +297,8 @@ impl ProxyPool {
                     .and_then(|until| until.checked_duration_since(now).map(|d| d.as_secs()));
                 ProxyNodeStatus {
                     index,
-                    url: config.url.clone(),
-                    has_auth: config.username.is_some(),
+                    url: proxy_url_without_auth(&config.url),
+                    has_auth: config.username.is_some() || proxy_url_has_auth(&config.url),
                     failures: state.failures[index],
                     cooling: remaining.is_some(),
                     cooldown_remaining_secs: remaining,
@@ -381,26 +391,39 @@ pub enum ProxyOverride {
 ///
 /// 统一处理「全局代理池 + 凭据级覆盖」的代理决策，并持有节点池的运行时状态。
 /// 全局单代理等价于只有一个节点的代理池，因此两种配置走完全相同的代码路径。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProxyManager {
     /// 全局代理节点池（None 表示不使用任何代理）
-    pool: Option<Arc<ProxyPool>>,
+    pool: Arc<RwLock<Option<Arc<ProxyPool>>>>,
+}
+
+impl Default for ProxyManager {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl ProxyManager {
     /// 创建代理管理器
     pub fn new(pool: Option<Arc<ProxyPool>>) -> Self {
-        Self { pool }
+        Self {
+            pool: Arc::new(RwLock::new(pool)),
+        }
+    }
+
+    /// 替换当前代理池（None 表示停用全局代理）
+    pub fn replace(&self, pool: Option<Arc<ProxyPool>>) {
+        *self.pool.write() = pool;
     }
 
     /// 是否配置了全局代理
     pub fn has_global_proxy(&self) -> bool {
-        self.pool.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
+        self.pool().map(|pool| !pool.is_empty()).unwrap_or(false)
     }
 
-    /// 代理节点池（None 表示未配置全局代理）
-    pub fn pool(&self) -> Option<&Arc<ProxyPool>> {
-        self.pool.as_ref()
+    /// 当前代理节点池（None 表示未配置全局代理）
+    pub fn pool(&self) -> Option<Arc<ProxyPool>> {
+        self.pool.read().clone()
     }
 
     /// 解析本次请求使用的代理
@@ -408,8 +431,8 @@ impl ProxyManager {
         match over {
             ProxyOverride::Direct => ProxySelection::Direct,
             ProxyOverride::Fixed(config) => ProxySelection::Fixed(config.clone()),
-            ProxyOverride::Inherit => match &self.pool {
-                Some(pool) => ProxyPool::acquire(pool),
+            ProxyOverride::Inherit => match self.pool() {
+                Some(pool) => ProxyPool::acquire(&pool),
                 None => ProxySelection::Direct,
             },
         }
@@ -417,7 +440,7 @@ impl ProxyManager {
 
     /// 节点状态快照
     pub fn status(&self) -> Vec<ProxyNodeStatus> {
-        match &self.pool {
+        match self.pool() {
             Some(pool) => pool.status(),
             None => Vec::new(),
         }
@@ -425,10 +448,41 @@ impl ProxyManager {
 
     /// 重置所有节点健康状态
     pub fn reset(&self) {
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = self.pool() {
             pool.reset();
         }
     }
+}
+
+/// 返回移除认证信息后的代理地址，用于状态展示和日志输出
+pub fn proxy_url_without_auth(raw: &str) -> String {
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{}", raw)
+    };
+    let Ok(mut url) = reqwest::Url::parse(&candidate) else {
+        return "***".to_string();
+    };
+
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let mut value = url.to_string();
+    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        value.pop();
+    }
+    value
+}
+
+fn proxy_url_has_auth(raw: &str) -> bool {
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{}", raw)
+    };
+    reqwest::Url::parse(&candidate)
+        .map(|url| !url.username().is_empty() || url.password().is_some())
+        .unwrap_or(false)
 }
 
 /// 根据应用配置构建全局代理节点池
@@ -537,7 +591,10 @@ pub fn build_client(
         }
 
         builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+        tracing::debug!(
+            "HTTP Client 使用代理: {}",
+            proxy_url_without_auth(&proxy_config.url)
+        );
     }
 
     Ok(builder.build()?)
@@ -762,6 +819,55 @@ mod tests {
 
         manager.reset();
         assert!(!manager.status()[0].cooling);
+    }
+
+    #[test]
+    fn test_manager_replace_pool_at_runtime_and_disable() {
+        let manager = ProxyManager::new(None);
+        assert!(!manager.has_global_proxy());
+        assert!(manager.resolve(&ProxyOverride::Inherit).proxy().is_none());
+
+        let pool = make_pool(2, ProxyPoolStrategy::RoundRobin, 3, 60_000);
+        manager.replace(Some(pool));
+        assert!(manager.has_global_proxy());
+        assert_eq!(manager.status().len(), 2);
+        assert!(manager.resolve(&ProxyOverride::Inherit).is_pooled());
+
+        manager.replace(None);
+        assert!(!manager.has_global_proxy());
+        assert!(manager.status().is_empty());
+        assert!(manager.resolve(&ProxyOverride::Inherit).proxy().is_none());
+    }
+
+    #[test]
+    fn test_proxy_status_masks_url_credentials() {
+        let pool = Arc::new(ProxyPool::new(
+            vec![ProxyConfig::new(
+                "http://embedded-user:embedded-pass@127.0.0.1:8080",
+            )],
+            ProxyPoolStrategy::RoundRobin,
+            3,
+            Duration::from_secs(60),
+        ));
+        let manager = ProxyManager::new(Some(pool));
+        let status = manager.status();
+
+        assert_eq!(status[0].url, "http://127.0.0.1:8080");
+        assert!(status[0].has_auth);
+        assert!(!status[0].url.contains("embedded-user"));
+        assert!(!status[0].url.contains("embedded-pass"));
+    }
+
+    #[test]
+    fn test_proxy_url_without_auth() {
+        assert_eq!(
+            proxy_url_without_auth("http://user:pass@127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            proxy_url_without_auth("127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
     }
 
     #[test]
